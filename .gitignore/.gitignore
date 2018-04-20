@@ -1,0 +1,76 @@
+class LBCLayer(nn.Conv2d):
+  
+  shared_weights = None
+  
+  def __init__(self, nChIn, nChOut, kernel_size, sparsity, share_weights=False):
+    super().__init__(nChIn, nChOut, kernel_size, padding=1, bias=False)
+    
+    if share_weights and LBCLayer.shared_weights is not None:
+      weights = LBCLayer.shared_weights
+    else:
+      num_elements = nChIn * nChOut * kernel_size * kernel_size
+
+      # Initialize weights randomly to -1 or 1
+      weights = torch.bernoulli(torch.FloatTensor(self.weight.data.shape).fill_(0.5)) * 2 - 1
+
+      # Set some of them to 0 according to sparsity
+      mask = torch.rand(weights.shape) > sparsity
+      weights = weights.masked_fill_(mask, 0).type(torch.FloatTensor)
+      
+      if share_weights:
+        LBCLayer.shared_weights = weights
+
+    # Assign it to the convolution weights
+    self.weight.data = weights
+
+    # No bias and no need to compute gradient on weights
+    self.bias = self.gradBias = None
+    self.weight.requires_grad = False
+
+    
+class BlockLBC(nn.Module):
+  def __init__(self, numChannels, numWeights, sparsity, share_weights=False):
+    super().__init__()
+    self.batch_norm = nn.BatchNorm2d(numChannels)
+    self.conv_lbp = LBCLayer(numChannels, numWeights, kernel_size=3, sparsity=sparsity, share_weights=share_weights)
+    self.conv_1x1 = nn.Conv2d(numWeights, numChannels, kernel_size=1)
+
+  def forward(self, x):
+    residual = x
+    x = self.batch_norm(x)
+    x = F.relu(self.conv_lbp(x))
+    x = self.conv_1x1(x)
+    x.add_(residual)
+    return x
+
+
+class LBCNN(nn.Module):
+  def __init__(self, imgChannels, numChannels=16, numWeights=512, full=128, 
+               depth=75, avgpool_kernel_size=8, avgpool_stride=4,
+              share_weights=False):
+    super().__init__()
+    
+    self.preprocess_block = nn.Sequential(
+        nn.Conv2d(imgChannels, numChannels, kernel_size=3, padding=1),
+        nn.BatchNorm2d(numChannels),
+        nn.ReLU(inplace=True)
+    )
+
+    chain = [BlockLBC(numChannels, numWeights, sparsity, share_weights) for i in range(depth)]
+    self.chained_blocks = nn.Sequential(*chain)
+    self.pool = nn.AvgPool2d(avgpool_kernel_size, avgpool_stride)
+
+    self.__fc1_dimension_in = numChannels * 6 * 6
+    self.dropout = nn.Dropout(0.5)
+    self.fc1 = nn.Linear(self.__fc1_dimension_in, full)
+    self.fc2 = nn.Linear(full, 10)
+
+  def forward(self, x):
+    x = self.preprocess_block(x)
+    x = self.chained_blocks(x)
+    x = self.pool(x)
+    x = x.view(-1, self.__fc1_dimension_in)
+    x = self.fc1(self.dropout(x))
+    x = F.relu(x)
+    x = self.fc2(self.dropout(x))
+    return x
